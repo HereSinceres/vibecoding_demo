@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>Three.js 多相机协同演示 - 辅助驾驶视角</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        font-family: "Microsoft YaHei", sans-serif;
+      }
+
+      /* 信息面板 */
+      .info {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        background: rgba(0, 0, 0, 0.7);
+        color: white;
+        padding: 10px 15px;
+        border-radius: 8px;
+        backdrop-filter: blur(5px);
+        z-index: 10;
+        pointer-events: none;
+        font-size: 14px;
+      }
+
+      /* 控制面板 */
+      .controls-panel {
+        position: absolute;
+        bottom: 20px;
+        left: 20px;
+        right: 20px;
+        background: rgba(0, 0, 0, 0.8);
+        color: white;
+        padding: 15px;
+        border-radius: 8px;
+        backdrop-filter: blur(5px);
+        z-index: 10;
+        font-size: 14px;
+        pointer-events: auto;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        justify-content: center;
+      }
+
+      button {
+        background: #4caf50;
+        color: white;
+        border: none;
+        padding: 8px 16px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 14px;
+        transition: all 0.3s;
+      }
+
+      button:hover {
+        background: #45a049;
+        transform: scale(1.02);
+      }
+
+      button.active {
+        background: #ff9800;
+        box-shadow: 0 0 10px rgba(255, 152, 0, 0.5);
+      }
+
+      .status {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        background: rgba(0, 0, 0, 0.7);
+        color: #0f0;
+        padding: 10px 15px;
+        border-radius: 8px;
+        font-family: monospace;
+        font-size: 12px;
+        z-index: 10;
+        pointer-events: none;
+      }
+
+      @media (max-width: 768px) {
+        .controls-panel button {
+          padding: 6px 12px;
+          font-size: 12px;
+        }
+        .info {
+          font-size: 10px;
+          top: 10px;
+          left: 10px;
+        }
+        .status {
+          font-size: 10px;
+          top: 10px;
+          right: 10px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="info">
+      🚗 多相机协同演示 | 主视角(3D) + 俯视地图(正交) + 后视镜
+    </div>
+    <div class="status">
+      🎮 当前模式: <span id="mode">主视角</span><br />
+      📊 Draw Calls: <span id="drawCalls">0</span>
+    </div>
+    <div class="controls-panel">
+      <button id="btn-main" class="active">🎥 主视角 (3D)</button>
+      <button id="btn-map">🗺️ 俯视地图 (正交)</button>
+      <button id="btn-rear">🪞 后视镜视角</button>
+      <button id="btn-split">🖥️ 三屏分屏模式</button>
+      <button id="btn-reset">🔄 重置车辆位置</button>
+    </div>
+
+    <!-- 引入 Three.js 核心库和扩展 -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.128.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.128.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import {
+        CSS2DRenderer,
+        CSS2DObject,
+      } from "three/addons/renderers/CSS2DRenderer.js";
+
+      // --- 初始化场景和渲染器 ---
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0a1030);
+      scene.fog = new THREE.FogExp2(0x0a1030, 0.003); // 雾效增强景深
+
+      // 主渲染器
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true; // 开启阴影映射
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.setPixelRatio(window.devicePixelRatio);
+      document.body.appendChild(renderer.domElement);
+
+      // CSS2渲染器用于文字标签
+      const labelRenderer = new CSS2DRenderer();
+      labelRenderer.setSize(window.innerWidth, window.innerHeight);
+      labelRenderer.domElement.style.position = "absolute";
+      labelRenderer.domElement.style.top = "0px";
+      labelRenderer.domElement.style.left = "0px";
+      labelRenderer.domElement.style.pointerEvents = "none";
+      document.body.appendChild(labelRenderer.domElement);
+
+      // --- 创建三个相机 ---
+
+      // 1. 主视角相机 (透视相机，跟随车辆)
+      const mainCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 500);
+      mainCamera.position.set(0, 2.5, 8);
+
+      // 2. 俯视地图相机 (正交相机，从上往下看)
+      const mapSize = 15;
+      const mapCamera = new THREE.OrthographicCamera(
+        -mapSize,
+        mapSize,
+        mapSize,
+        -mapSize,
+        0.1,
+        100,
+      );
+      mapCamera.position.set(0, 25, 0);
+      mapCamera.lookAt(0, 0, 0);
+
+      // 3. 后视镜相机 (透视相机，向后看)
+      const rearCamera = new THREE.PerspectiveCamera(70, 1, 0.1, 100);
+      rearCamera.position.set(0, 1.2, -3);
+      rearCamera.rotation.y = Math.PI; // 朝后看
+
+      // 当前激活的相机 (用于全屏模式)
+      let currentCamera = mainCamera;
+      let currentMode = "main"; // main, map, rear, split
+      let splitScreenMode = false;
+
+      // --- 辅助元素: 地面网格和参考系 ---
+
+      // 地面网格 (帮助理解空间)
+      const gridHelper = new THREE.GridHelper(100, 20, 0x88aaff, 0x335588);
+      gridHelper.position.y = -0.5;
+      gridHelper.material.transparent = true;
+      gridHelper.material.opacity = 0.6;
+      scene.add(gridHelper);
+
+      // 辅助轴线
+      const axesHelper = new THREE.AxesHelper(12);
+      axesHelper.material.transparent = true;
+      axesHelper.material.opacity = 0.2;
+      scene.add(axesHelper);
+
+      // 添加一些参考物体: 道路标记点
+      const roadMarkers = [];
+      for (let i = -40; i <= 40; i += 5) {
+        const markerGeo = new THREE.SphereGeometry(0.15, 8, 8);
+        const markerMat = new THREE.MeshStandardMaterial({
+          color: 0xffaa44,
+          emissive: 0x442200,
+        });
+        const marker = new THREE.Mesh(markerGeo, markerMat);
+        marker.position.set(i, -0.4, 0);
+        scene.add(marker);
+        roadMarkers.push(marker);
+      }
+
+      // 添加一些树木/障碍物来丰富场景
+      const treeMat = new THREE.MeshStandardMaterial({ color: 0x5c9e5e });
+      const trunkMat = new THREE.MeshStandardMaterial({ color: 0x8b5a2b });
+      for (let i = -30; i <= 30; i += 8) {
+        if (Math.abs(i) < 5) continue; // 避开车辆起始区
+        const treeGroup = new THREE.Group();
+        const trunk = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.4, 0.5, 1.2, 6),
+          trunkMat,
+        );
+        trunk.position.y = 0;
+        const foliage = new THREE.Mesh(
+          new THREE.ConeGeometry(0.6, 1.2, 8),
+          treeMat,
+        );
+        foliage.position.y = 0.9;
+        treeGroup.add(trunk, foliage);
+        treeGroup.position.set(i, -0.3, 3.5);
+        scene.add(treeGroup);
+
+        // 对称的另一侧
+        const treeGroup2 = treeGroup.clone();
+        treeGroup2.position.set(i, -0.3, -3.5);
+        scene.add(treeGroup2);
+      }
+
+      // 添加随机漂浮粒子 (增加视觉丰富度)
+      const particleCount = 400;
+      const particlesGeometry = new THREE.BufferGeometry();
+      const particlePositions = new Float32Array(particleCount * 3);
+      for (let i = 0; i < particleCount; i++) {
+        particlePositions[i * 3] = (Math.random() - 0.5) * 80;
+        particlePositions[i * 3 + 1] = Math.random() * 8;
+        particlePositions[i * 3 + 2] = (Math.random() - 0.5) * 40;
+      }
+      particlesGeometry.setAttribute(
+        "position",
+        new THREE.BufferAttribute(particlePositions, 3),
+      );
+      const particlesMaterial = new THREE.PointsMaterial({
+        color: 0x88aaff,
+        size: 0.08,
+        transparent: true,
+        opacity: 0.5,
+      });
+      const particles = new THREE.Points(particlesGeometry, particlesMaterial);
+      scene.add(particles);
+
+      // --- 车辆模型 (组合体) ---
+      const carGroup = new THREE.Group();
+
+      // 车身
+      const bodyGeo = new THREE.BoxGeometry(0.9, 0.4, 1.8);
+      const bodyMat = new THREE.MeshStandardMaterial({
+        color: 0x3a86ff,
+        metalness: 0.7,
+        roughness: 0.3,
+      });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      body.castShadow = true;
+      body.receiveShadow = true;
+      body.position.y = 0.2;
+      carGroup.add(body);
+
+      // 车顶
+      const roofGeo = new THREE.BoxGeometry(0.7, 0.3, 1.1);
+      const roofMat = new THREE.MeshStandardMaterial({
+        color: 0x2c3e66,
+        metalness: 0.5,
+      });
+      const roof = new THREE.Mesh(roofGeo, roofMat);
+      roof.position.y = 0.55;
+      roof.castShadow = true;
+      carGroup.add(roof);
+
+      // 车轮
+      const wheelMat = new THREE.MeshStandardMaterial({
+        color: 0x222222,
+        metalness: 0.8,
+        roughness: 0.4,
+      });
+      const positions = [
+        [-0.55, 0.1, -0.7],
+        [0.55, 0.1, -0.7],
+        [-0.55, 0.1, 0.7],
+        [0.55, 0.1, 0.7],
+      ];
+      positions.forEach((pos) => {
+        const wheelGeo = new THREE.CylinderGeometry(0.35, 0.35, 0.4, 24);
+        const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+        wheel.rotation.z = Math.PI / 2;
+        wheel.position.set(pos[0], pos[1], pos[2]);
+        wheel.castShadow = true;
+        carGroup.add(wheel);
+      });
+
+      // 添加一点蓝色光晕 (车灯效果)
+      const headlightMat = new THREE.MeshStandardMaterial({
+        color: 0xffaa66,
+        emissive: 0xff4400,
+        emissiveIntensity: 0.5,
+      });
+      const headlight = new THREE.Mesh(
+        new THREE.SphereGeometry(0.12, 8, 8),
+        headlightMat,
+      );
+      headlight.position.set(0, 0.2, 0.95);
+      carGroup.add(headlight);
+
+      scene.add(carGroup);
+
+      // CSS2D 文字标签: 显示速度/状态
+      const statusDiv = document.createElement("div");
+      statusDiv.textContent = "🚗 时速: 0 km/h";
+      statusDiv.style.color = "white";
+      statusDiv.style.fontSize = "14px";
+      statusDiv.style.fontWeight = "bold";
+      statusDiv.style.backgroundColor = "rgba(0,0,0,0.6)";
+      statusDiv.style.padding = "2px 8px";
+      statusDiv.style.borderRadius = "12px";
+      statusDiv.style.border = "1px solid #3a86ff";
+      const labelObj = new CSS2DObject(statusDiv);
+      labelObj.position.set(0, 1.0, 0);
+      carGroup.add(labelObj);
+
+      // 添加车辆周围的包围盒指示器 (可选，辅助观察)
+      const boundingWireframe = new THREE.BoxHelper(carGroup, 0xffaa44);
+      scene.add(boundingWireframe);
+
+      // --- 车辆运动控制 ---
+      let carSpeed = 0;
+      let carAngle = 0;
+      let carPosition = { x: 0, z: 0 };
+      const maxSpeed = 12;
+      const acceleration = 0.3;
+      const deceleration = 0.2;
+      const turnSpeed = 0.045;
+
+      // 键盘控制
+      const keyState = {
+        ArrowUp: false,
+        ArrowDown: false,
+        ArrowLeft: false,
+        ArrowRight: false,
+      };
+
+      window.addEventListener("keydown", (e) => {
+        if (keyState.hasOwnProperty(e.key)) {
+          keyState[e.key] = true;
+          e.preventDefault();
+        }
+      });
+      window.addEventListener("keyup", (e) => {
+        if (keyState.hasOwnProperty(e.key)) {
+          keyState[e.key] = false;
+          e.preventDefault();
+        }
+      });
+
+      function updateCarMovement() {
+        // 加速/减速
+        if (keyState.ArrowUp) {
+          carSpeed = Math.min(maxSpeed, carSpeed + acceleration);
+        } else if (keyState.ArrowDown) {
+          carSpeed = Math.max(-maxSpeed * 0.6, carSpeed - acceleration);
+        } else {
+          // 自然减速
+          if (Math.abs(carSpeed) > 0.1) carSpeed *= 0.98;
+          else carSpeed = 0;
+        }
+
+        // 转向: 速度越快转向半径越大 (限制最大转向角度)
+        let turn = 0;
+        if (keyState.ArrowLeft) turn = 1;
+        if (keyState.ArrowRight) turn = -1;
+        if (Math.abs(carSpeed) > 0.5) {
+          const turnFactor = Math.min(1.0, Math.abs(carSpeed) / maxSpeed);
+          carAngle += turn * turnSpeed * (1 - turnFactor * 0.5);
+        }
+
+        // 更新位置
+        const moveDistance = carSpeed * 0.16; // 每帧移动距离 (假设60fps 约0.016秒，这里简化系数)
+        carPosition.x += Math.sin(carAngle) * moveDistance;
+        carPosition.z += Math.cos(carAngle) * moveDistance;
+
+        // 边界限制 (让车辆在 -35 到 35 范围内)
+        carPosition.x = Math.max(-32, Math.min(32, carPosition.x));
+        carPosition.z = Math.max(-28, Math.min(28, carPosition.z));
+
+        // 应用变换
+        carGroup.position.x = carPosition.x;
+        carGroup.position.z = carPosition.z;
+        carGroup.rotation.y = carAngle;
+
+        // 更新文字标签显示速度
+        const speedKmh = Math.abs(carSpeed * 8).toFixed(0);
+        statusDiv.textContent = `🚗 ${carSpeed > 0 ? "前进" : carSpeed < 0 ? "倒车" : "停止"} ${speedKmh} km/h`;
+
+        // 让粒子系统缓慢飘移，增加动感
+        particles.rotation.y += 0.002;
+      }
+
+      // --- 相机跟随逻辑 ---
+      function updateCameras() {
+        // 主视角相机: 跟随车辆后方偏移 (保持相对角度)
+        const relativeAngle = carAngle;
+        const offsetDistance = 7.5;
+        const offsetHeight = 2.8;
+        // 计算跟随位置: 车辆后方
+        const camX = carPosition.x - Math.sin(relativeAngle) * offsetDistance;
+        const camZ = carPosition.z - Math.cos(relativeAngle) * offsetDistance;
+        mainCamera.position.x = camX;
+        mainCamera.position.z = camZ;
+        mainCamera.position.y = offsetHeight;
+        mainCamera.lookAt(carPosition.x, 0.5, carPosition.z);
+
+        // 俯视地图相机: 直接跟随车辆上方
+        mapCamera.position.x = carPosition.x;
+        mapCamera.position.z = carPosition.z;
+        mapCamera.lookAt(carPosition.x, 0, carPosition.z);
+
+        // 后视镜相机: 固定在车辆后方并朝后 (但需要随车辆旋转)
+        const rearOffsetX = -Math.sin(relativeAngle) * 2.2;
+        const rearOffsetZ = -Math.cos(relativeAngle) * 2.2;
+        rearCamera.position.x = carPosition.x + rearOffsetX;
+        rearCamera.position.z = carPosition.z + rearOffsetZ;
+        rearCamera.position.y = 1.2;
+        // 后视镜看向车辆后方: 角度=车头方向+180度
+        const lookAtX = carPosition.x - Math.sin(relativeAngle) * 5;
+        const lookAtZ = carPosition.z - Math.cos(relativeAngle) * 5;
+        rearCamera.lookAt(lookAtX, 0.8, lookAtZ);
+      }
+
+      // --- UI 交互 ---
+      const btnMain = document.getElementById("btn-main");
+      const btnMap = document.getElementById("btn-map");
+      const btnRear = document.getElementById("btn-rear");
+      const btnSplit = document.getElementById("btn-split");
+      const btnReset = document.getElementById("btn-reset");
+      const modeSpan = document.getElementById("mode");
+      const drawCallsSpan = document.getElementById("drawCalls");
+
+      function setMode(mode) {
+        splitScreenMode = mode === "split";
+        currentMode = mode;
+
+        btnMain.classList.remove("active");
+        btnMap.classList.remove("active");
+        btnRear.classList.remove("active");
+        btnSplit.classList.remove("active");
+
+        if (mode === "main") {
+          btnMain.classList.add("active");
+          modeSpan.textContent = "主视角 (3D)";
+        } else if (mode === "map") {
+          btnMap.classList.add("active");
+          modeSpan.textContent = "俯视地图 (正交)";
+        } else if (mode === "rear") {
+          btnRear.classList.add("active");
+          modeSpan.textContent = "后视镜视角";
+        } else if (mode === "split") {
+          btnSplit.classList.add("active");
+          modeSpan.textContent = "三屏分屏模式";
+        }
+      }
+
+      btnMain.addEventListener("click", () => setMode("main"));
+      btnMap.addEventListener("click", () => setMode("map"));
+      btnRear.addEventListener("click", () => setMode("rear"));
+      btnSplit.addEventListener("click", () => setMode("split"));
+      btnReset.addEventListener("click", () => {
+        carPosition = { x: 0, z: 0 };
+        carAngle = 0;
+        carSpeed = 0;
+        carGroup.position.set(0, 0, 0);
+        carGroup.rotation.y = 0;
+        updateCameras();
+      });
+
+      // --- 渲染分屏逻辑 ---
+      function renderSplitScreen() {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+
+        // 主视角占据左半屏 2/3 区域 (较大)
+        const mainWidth = width * 0.66;
+        renderer.setViewport(0, 0, mainWidth, height);
+        renderer.setScissor(0, 0, mainWidth, height);
+        renderer.setScissorTest(true);
+        renderer.render(scene, mainCamera);
+
+        // 俯视地图占据右上角
+        const mapWidth = width * 0.33;
+        const mapHeight = height * 0.55;
+        renderer.setViewport(
+          mainWidth,
+          height - mapHeight,
+          mapWidth,
+          mapHeight,
+        );
+        renderer.setScissor(mainWidth, height - mapHeight, mapWidth, mapHeight);
+        renderer.setScissorTest(true);
+        renderer.render(scene, mapCamera);
+
+        // 后视镜占据右下角
+        const rearHeight = height * 0.43;
+        renderer.setViewport(mainWidth, 0, mapWidth, rearHeight);
+        renderer.setScissor(mainWidth, 0, mapWidth, rearHeight);
+        renderer.setScissorTest(true);
+        renderer.render(scene, rearCamera);
+
+        // CSS2D渲染器也要分区域? CSS2D不支持scissor，简单起见只全屏渲染，视觉上文字可能会重叠，但影响不大
+        labelRenderer.render(scene, mainCamera);
+      }
+
+      // --- 动画循环 & Draw Call 统计 ---
+      let frameCount = 0;
+      let lastTime = performance.now();
+
+      function animate() {
+        requestAnimationFrame(animate);
+
+        // 更新车辆运动
+        updateCarMovement();
+        updateCameras();
+
+        // 更新包围盒跟随
+        boundingWireframe.update();
+
+        // 渲染场景
+        if (splitScreenMode) {
+          renderSplitScreen();
+        } else {
+          // 全屏单一相机模式
+          let activeCamera = mainCamera;
+          if (currentMode === "map") activeCamera = mapCamera;
+          else if (currentMode === "rear") activeCamera = rearCamera;
+          else activeCamera = mainCamera;
+
+          renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+          renderer.setScissorTest(false);
+          renderer.render(scene, activeCamera);
+          labelRenderer.render(scene, activeCamera);
+        }
+
+        // 统计 Draw Calls 近似值 (Three.js 渲染器信息)
+        if (renderer.info && renderer.info.render) {
+          drawCallsSpan.textContent = renderer.info.render.calls;
+        } else {
+          drawCallsSpan.textContent = "N/A";
+        }
+
+        // 简单性能日志
+        frameCount++;
+        const now = performance.now();
+        if (now - lastTime >= 1000) {
+          // 可选: 控制台输出性能，不干扰界面
+          lastTime = now;
+          frameCount = 0;
+        }
+      }
+
+      // 窗口大小适配
+      window.addEventListener("resize", onWindowResize, false);
+      function onWindowResize() {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        renderer.setSize(width, height);
+        labelRenderer.setSize(width, height);
+
+        // 更新相机宽高比
+        mainCamera.aspect = width / height;
+        mainCamera.updateProjectionMatrix();
+
+        const aspect = width / height;
+        const viewSize = 15;
+        mapCamera.left = -viewSize * aspect;
+        mapCamera.right = viewSize * aspect;
+        mapCamera.top = viewSize;
+        mapCamera.bottom = -viewSize;
+        mapCamera.updateProjectionMatrix();
+
+        rearCamera.aspect = width / height;
+        rearCamera.updateProjectionMatrix();
+      }
+
+      // 添加一些环境光 + 方向光，让阴影和材质更好看
+      const ambientLight = new THREE.AmbientLight(0x404060);
+      scene.add(ambientLight);
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+      dirLight.position.set(5, 10, 7);
+      dirLight.castShadow = true;
+      dirLight.receiveShadow = true;
+      dirLight.shadow.mapSize.width = 1024;
+      dirLight.shadow.mapSize.height = 1024;
+      dirLight.shadow.camera.near = 0.5;
+      dirLight.shadow.camera.far = 30;
+      dirLight.shadow.camera.left = -10;
+      dirLight.shadow.camera.right = 10;
+      dirLight.shadow.camera.top = 10;
+      dirLight.shadow.camera.bottom = -10;
+      scene.add(dirLight);
+
+      const backLight = new THREE.PointLight(0x4466cc, 0.3);
+      backLight.position.set(0, 3, -5);
+      scene.add(backLight);
+
+      const fillLight = new THREE.PointLight(0xffaa66, 0.2);
+      fillLight.position.set(2, 2, 3);
+      scene.add(fillLight);
+
+      // 启动动画
+      onWindowResize();
+      animate();
+
+      // 控制台提示
+      console.log(
+        "多相机协同演示已启动 | 使用方向键控制车辆 | 切换相机模式查看不同视角",
+      );
+    </script>
+  </body>
+</html>
