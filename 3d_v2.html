@@ -1,0 +1,797 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>辅助驾驶可视化 - Web Worker 数据流架构</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+      }
+
+      /* UI 面板 */
+      .dashboard {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        background: rgba(0, 0, 0, 0.85);
+        backdrop-filter: blur(10px);
+        color: #0f0;
+        padding: 15px 20px;
+        border-radius: 12px;
+        font-family: monospace;
+        font-size: 12px;
+        z-index: 100;
+        border-left: 3px solid #00ff00;
+        pointer-events: none;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+      }
+
+      .dashboard h3 {
+        margin: 0 0 8px 0;
+        color: #fff;
+        font-size: 14px;
+      }
+
+      .dashboard .stat {
+        margin: 4px 0;
+      }
+
+      .dashboard .label {
+        color: #aaa;
+      }
+
+      .dashboard .value {
+        color: #0f0;
+        font-weight: bold;
+      }
+
+      .status-panel {
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        background: rgba(0, 0, 0, 0.85);
+        backdrop-filter: blur(10px);
+        padding: 15px 20px;
+        border-radius: 12px;
+        color: white;
+        font-size: 12px;
+        z-index: 100;
+        text-align: right;
+        border-right: 3px solid #ffaa00;
+        pointer-events: none;
+      }
+
+      .controls-panel {
+        position: absolute;
+        bottom: 20px;
+        left: 20px;
+        right: 20px;
+        background: rgba(0, 0, 0, 0.9);
+        backdrop-filter: blur(10px);
+        padding: 12px 20px;
+        border-radius: 12px;
+        z-index: 100;
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        justify-content: center;
+        font-size: 12px;
+      }
+
+      button {
+        background: #2a6f4f;
+        color: white;
+        border: none;
+        padding: 8px 16px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+        transition: all 0.2s;
+        font-weight: bold;
+      }
+
+      button:hover {
+        background: #1e8f5e;
+        transform: translateY(-1px);
+      }
+
+      button.active {
+        background: #ff9800;
+        box-shadow: 0 0 10px rgba(255, 152, 0, 0.5);
+      }
+
+      button.danger {
+        background: #c44536;
+      }
+
+      button.danger:hover {
+        background: #e05a4a;
+      }
+
+      .info-text {
+        position: absolute;
+        bottom: 80px;
+        left: 20px;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 5px 10px;
+        border-radius: 6px;
+        font-size: 11px;
+        color: #ccc;
+        font-family: monospace;
+        pointer-events: none;
+      }
+
+      @media (max-width: 768px) {
+        .dashboard {
+          font-size: 10px;
+          padding: 10px 15px;
+        }
+        .status-panel {
+          font-size: 10px;
+          padding: 10px 15px;
+        }
+        button {
+          padding: 6px 12px;
+          font-size: 10px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="dashboard">
+      <h3>🚗 辅助驾驶数据流架构</h3>
+      <div class="stat">📊 Worker 线程 | 主线程渲染 | 零拷贝传输</div>
+      <div class="stat">
+        🎯 Draw Calls: <span id="drawCalls" class="value">0</span>
+      </div>
+      <div class="stat">
+        📍 目标数量: <span id="objectCount" class="value">0</span>
+      </div>
+      <div class="stat">
+        💾 点云数量: <span id="pointCount" class="value">0</span>
+      </div>
+      <div class="stat">
+        ⚡ 帧耗时: <span id="frameTime" class="value">0</span> ms
+      </div>
+      <div class="stat">
+        🔄 数据频率: <span id="dataRate" class="value">0</span> Hz
+      </div>
+    </div>
+
+    <div class="status-panel">
+      <div>🟢 系统状态: <span id="systemStatus">运行中</span></div>
+      <div>🧠 Worker 状态: <span id="workerStatus">空闲</span></div>
+      <div>
+        📦 传输方式: <span id="transferMode">Transferable Objects</span>
+      </div>
+      <div>🎨 渲染模式: <span id="renderMode">增量更新</span></div>
+    </div>
+
+    <div class="controls-panel">
+      <button id="btn-toggle-data" class="active">⏸️ 暂停数据流</button>
+      <button id="btn-reset-camera">🎥 重置相机</button>
+      <button id="btn-toggle-points">🔘 切换点云显示</button>
+      <button id="btn-toggle-boxes">📦 切换目标框显示</button>
+      <button id="btn-simulate-heavy">⚡ 模拟高负载 (增加点云密度)</button>
+    </div>
+
+    <div class="info-text">
+      💡 演示说明: Worker 模拟传感器数据 (10-20Hz) → 坐标系转换/降采样 →
+      Transferable 传输 → 主线程增量渲染
+    </div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.128.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.128.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import {
+        CSS2DRenderer,
+        CSS2DObject,
+      } from "three/addons/renderers/CSS2DRenderer.js";
+
+      // ==================== 1. 初始化渲染器 ====================
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0a0a2a);
+      scene.fog = new THREE.FogExp2(0x0a0a2a, 0.008);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.shadowMap.enabled = true;
+      renderer.setPixelRatio(window.devicePixelRatio);
+      document.body.appendChild(renderer.domElement);
+
+      const labelRenderer = new CSS2DRenderer();
+      labelRenderer.setSize(window.innerWidth, window.innerHeight);
+      labelRenderer.domElement.style.position = "absolute";
+      labelRenderer.domElement.style.top = "0px";
+      labelRenderer.domElement.style.left = "0px";
+      labelRenderer.domElement.style.pointerEvents = "none";
+      document.body.appendChild(labelRenderer.domElement);
+
+      // 相机配置
+      const camera = new THREE.PerspectiveCamera(
+        65,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        300,
+      );
+      camera.position.set(8, 6, 12);
+      camera.lookAt(0, 0, 0);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+      controls.zoomSpeed = 1.2;
+      controls.rotateSpeed = 1.0;
+      controls.target.set(0, 0, 0);
+
+      // ==================== 2. 场景装饰 ====================
+      // 地面网格
+      const gridHelper = new THREE.GridHelper(80, 30, 0x44aaff, 0x336699);
+      gridHelper.position.y = -0.2;
+      scene.add(gridHelper);
+
+      // 参考轴线
+      const axesHelper = new THREE.AxesHelper(15);
+      axesHelper.material.transparent = true;
+      axesHelper.material.opacity = 0.15;
+      scene.add(axesHelper);
+
+      // 道路参考线 (虚线效果)
+      const roadLineMat = new THREE.LineBasicMaterial({ color: 0xffaa44 });
+      for (let z = -35; z <= 35; z += 2.5) {
+        if (Math.abs(z) % 5 < 0.1) continue;
+        const points = [];
+        points.push(new THREE.Vector3(-1.5, -0.15, z));
+        points.push(new THREE.Vector3(1.5, -0.15, z));
+        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        const line = new THREE.Line(geometry, roadLineMat);
+        scene.add(line);
+      }
+
+      // 环境光 + 动态光源
+      const ambientLight = new THREE.AmbientLight(0x404060);
+      scene.add(ambientLight);
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+      dirLight.position.set(5, 12, 8);
+      dirLight.castShadow = true;
+      dirLight.receiveShadow = false;
+      scene.add(dirLight);
+      const fillLight = new THREE.PointLight(0x4466cc, 0.4);
+      fillLight.position.set(0, 3, 0);
+      scene.add(fillLight);
+
+      // 自车模型 (简单示意)
+      const egoVehicle = new THREE.Group();
+      const bodyMat = new THREE.MeshStandardMaterial({
+        color: 0x3a86ff,
+        metalness: 0.6,
+        roughness: 0.3,
+      });
+      const bodyGeo = new THREE.BoxGeometry(0.9, 0.4, 1.9);
+      const bodyMesh = new THREE.Mesh(bodyGeo, bodyMat);
+      bodyMesh.position.y = 0.2;
+      bodyMesh.castShadow = true;
+      egoVehicle.add(bodyMesh);
+
+      const roofMat = new THREE.MeshStandardMaterial({ color: 0x2c3e66 });
+      const roofGeo = new THREE.BoxGeometry(0.7, 0.3, 1.2);
+      const roofMesh = new THREE.Mesh(roofGeo, roofMat);
+      roofMesh.position.y = 0.55;
+      egoVehicle.add(roofMesh);
+
+      const wheelMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+      const wheelPos = [
+        [-0.55, 0.1, -0.75],
+        [0.55, 0.1, -0.75],
+        [-0.55, 0.1, 0.7],
+        [0.55, 0.1, 0.7],
+      ];
+      wheelPos.forEach((pos) => {
+        const wheelGeo = new THREE.CylinderGeometry(0.32, 0.32, 0.4, 16);
+        const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+        wheel.rotation.z = Math.PI / 2;
+        wheel.position.set(pos[0], pos[1], pos[2]);
+        egoVehicle.add(wheel);
+      });
+
+      scene.add(egoVehicle);
+      egoVehicle.position.set(0, -0.1, 0);
+
+      // CSS2D 标签
+      const egoDiv = document.createElement("div");
+      egoDiv.textContent = "🚗 自车";
+      egoDiv.style.backgroundColor = "rgba(58,134,255,0.8)";
+      egoDiv.style.color = "white";
+      egoDiv.style.padding = "2px 8px";
+      egoDiv.style.borderRadius = "12px";
+      egoDiv.style.fontSize = "12px";
+      egoDiv.style.fontWeight = "bold";
+      const egoLabel = new CSS2DObject(egoDiv);
+      egoLabel.position.set(0, 1.0, 0);
+      egoVehicle.add(egoLabel);
+
+      // ==================== 3. 预分配渲染资源 ====================
+      // 点云渲染器 (使用 PointsMaterial 并预分配 Buffer)
+      const MAX_POINTS = 500000;
+      const pointPositions = new Float32Array(MAX_POINTS * 3);
+      const pointColors = new Float32Array(MAX_POINTS * 3);
+
+      const pointGeometry = new THREE.BufferGeometry();
+      pointGeometry.setAttribute(
+        "position",
+        new THREE.BufferAttribute(pointPositions, 3),
+      );
+      pointGeometry.setAttribute(
+        "color",
+        new THREE.BufferAttribute(pointColors, 3),
+      );
+
+      const pointMaterial = new THREE.PointsMaterial({
+        size: 0.08,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.7,
+      });
+      const pointsSystem = new THREE.Points(pointGeometry, pointMaterial);
+      scene.add(pointsSystem);
+
+      // 目标框渲染器 (InstancedMesh)
+      const BOX_MAX_COUNT = 2000;
+      const boxGeometry = new THREE.BoxGeometry(1, 1.5, 1.8);
+      const boxMaterial = new THREE.MeshStandardMaterial({
+        color: 0xff6633,
+        emissive: 0x441100,
+        transparent: true,
+        opacity: 0.7,
+      });
+      const instancedBoxes = new THREE.InstancedMesh(
+        boxGeometry,
+        boxMaterial,
+        BOX_MAX_COUNT,
+      );
+      instancedBoxes.castShadow = true;
+      instancedBoxes.receiveShadow = false;
+      scene.add(instancedBoxes);
+
+      // 用于存储每个实例的临时矩阵
+      const instanceMatrix = new THREE.Matrix4();
+      let currentBoxCount = 0;
+
+      // 添加边框线框辅助 (可选)
+      const boxWireframes = [];
+
+      // ==================== 4. 创建 Web Worker ====================
+      const workerCode = `
+          // 模拟传感器数据生成 + 数据处理
+          let dataInterval = null;
+          let isRunning = true;
+          let frameId = 0;
+
+          // 配置参数
+          let pointCloudDensity = 180000;   // 基础点云数量
+          let objectCount = 100;            // 目标数量
+
+          // 动态物体位置 (模拟移动)
+          let dynamicObjects = [];
+          for (let i = 0; i < 250; i++) {
+              dynamicObjects.push({
+                  id: i,
+                  x: (Math.random() - 0.5) * 35,
+                  z: (Math.random() - 0.5) * 30,
+                  vx: (Math.random() - 0.5) * 1.2,
+                  vz: (Math.random() - 0.5) * 1.2,
+                  type: i % 3,
+                  width: 0.8 + Math.random() * 0.5,
+                  height: 1.2 + Math.random() * 0.8,
+                  length: 1.5 + Math.random() * 0.8
+              });
+          }
+
+          // 坐标系转换函数 (模拟雷达坐标系 -> 世界坐标系)
+          function transformCoordinates(points) {
+              // 模拟简单的旋转/平移，实际场景中会有复杂变换
+              return points.map(p => ({
+                  x: p.x * 0.98 + p.z * 0.02,
+                  y: p.y + 0.1,
+                  z: p.z * 0.98 - p.x * 0.02
+              }));
+          }
+
+          // 降采样 (随机采样保持数量稳定)
+          function downsample(points, targetCount) {
+              if (points.length <= targetCount) return points;
+              const step = points.length / targetCount;
+              const result = [];
+              for (let i = 0; i < targetCount; i++) {
+                  result.push(points[Math.floor(i * step)]);
+              }
+              return result;
+          }
+
+          // 生成点云数据 (模拟激光雷达)
+          function generatePointCloud(centerX, centerZ, density) {
+              const points = [];
+              const radius = 18;
+              for (let i = 0; i < density; i++) {
+                  // 极坐标生成点云，模拟环形扫描
+                  const angle = Math.random() * Math.PI * 2;
+                  const r = Math.pow(Math.random(), 1.2) * radius;
+                  const x = centerX + Math.cos(angle) * r;
+                  const z = centerZ + Math.sin(angle) * r;
+                  const y = Math.sin(angle * 3) * 0.3 + Math.random() * 0.5 - 0.2;
+                  // 根据距离设置颜色 (热力图效果)
+                  const colorVal = Math.min(1, r / radius);
+                  points.push({ x, y, z, intensity: 1 - colorVal });
+              }
+              return points;
+          }
+
+          // 生成目标检测框 (带运动轨迹)
+          function updateDynamicObjects() {
+              const objects = [];
+              for (let obj of dynamicObjects) {
+                  // 更新位置
+                  obj.x += obj.vx * 0.05;
+                  obj.z += obj.vz * 0.05;
+                  // 边界反弹 (模拟在道路范围内移动)
+                  if (Math.abs(obj.x) > 28) obj.vx *= -0.9;
+                  if (Math.abs(obj.z) > 24) obj.vz *= -0.9;
+                  obj.x = Math.max(-28, Math.min(28, obj.x));
+                  obj.z = Math.max(-22, Math.min(22, obj.z));
+
+                  objects.push({
+                      id: obj.id,
+                      x: obj.x,
+                      z: obj.z,
+                      y: 0,
+                      width: obj.width,
+                      height: obj.height,
+                      length: obj.length,
+                      type: obj.type,
+                      speed: Math.sqrt(obj.vx*obj.vx + obj.vz*obj.vz)
+                  });
+              }
+              return objects;
+          }
+
+          // 主数据处理函数
+          function processFrame() {
+              if (!isRunning) return;
+
+              const timestamp = performance.now();
+
+              // 模拟自车位置 (动态移动，产生场景变化)
+              const egoX = Math.sin(Date.now() * 0.0008) * 3;
+              const egoZ = Math.cos(Date.now() * 0.0005) * 2;
+
+              // 1. 生成原始点云
+              let rawPoints = generatePointCloud(egoX, egoZ, pointCloudDensity);
+
+              // 2. 坐标系转换
+              let transformedPoints = transformCoordinates(rawPoints);
+
+              // 3. 降采样到合理数量 (保持帧率稳定)
+              const targetPointCount = Math.min(120000, pointCloudDensity);
+              let sampledPoints = downsample(transformedPoints, targetPointCount);
+
+              // 4. 生成动态目标框
+              let boxes = updateDynamicObjects();
+
+              // 5. 准备传输数据 (使用可转移对象)
+              const pointData = new Float32Array(sampledPoints.length * 3);
+              const colorData = new Float32Array(sampledPoints.length * 3);
+              for (let i = 0; i < sampledPoints.length; i++) {
+                  pointData[i*3] = sampledPoints[i].x;
+                  pointData[i*3+1] = sampledPoints[i].y;
+                  pointData[i*3+2] = sampledPoints[i].z;
+                  // 基于强度/距离的颜色
+                  const intensity = sampledPoints[i].intensity || 0.5;
+                  colorData[i*3] = 0.2 + intensity * 0.8;   // R
+                  colorData[i*3+1] = 0.1 + intensity * 0.6; // G
+                  colorData[i*3+2] = 0.4 + intensity * 0.4; // B
+              }
+
+              const boxData = boxes.map(b => ({
+                  x: b.x, z: b.z, y: b.y,
+                  width: b.width, height: b.height, length: b.length,
+                  type: b.type, id: b.id, speed: b.speed
+              }));
+
+              // 发送到主线程 (转移 ArrayBuffer 所有权)
+              self.postMessage({
+                  type: 'sensor_data',
+                  timestamp: timestamp,
+                  egoPosition: { x: egoX, z: egoZ },
+                  points: pointData.buffer,
+                  colors: colorData.buffer,
+                  pointCount: sampledPoints.length,
+                  boxes: boxData,
+                  frameId: frameId++
+              }, [pointData.buffer, colorData.buffer]); // 转移所有权，零拷贝
+          }
+
+          // 启动数据流
+          function startStream() {
+              if (dataInterval) clearInterval(dataInterval);
+              dataInterval = setInterval(() => {
+                  processFrame();
+              }, 60); // 约16.6ms -> 60Hz 模拟高频传感器
+              isRunning = true;
+          }
+
+          function stopStream() {
+              if (dataInterval) {
+                  clearInterval(dataInterval);
+                  dataInterval = null;
+              }
+              isRunning = false;
+          }
+
+          // 接收主线程控制消息
+          self.addEventListener('message', (e) => {
+              const { command, density } = e.data;
+              if (command === 'start') startStream();
+              if (command === 'stop') stopStream();
+              if (command === 'setDensity' && density) {
+                  pointCloudDensity = Math.min(25000, Math.max(3000, density));
+              }
+          });
+
+          // 自动启动
+          startStream();
+      `;
+
+      // 创建 Worker Blob
+      const blob = new Blob([workerCode], { type: "application/javascript" });
+      const worker = new Worker(URL.createObjectURL(blob));
+
+      // ==================== 5. 主线程渲染管理 ====================
+      let currentPointCount = 0;
+      let currentBoxList = [];
+      let frameTimeHistory = [];
+      let dataReceiveCount = 0;
+      let lastDataTimestamp = 0;
+      let showPoints = true;
+      let showBoxes = true;
+      let dataStreamActive = true;
+
+      // UI 元素
+      const drawCallsSpan = document.getElementById("drawCalls");
+      const objectCountSpan = document.getElementById("objectCount");
+      const pointCountSpan = document.getElementById("pointCount");
+      const frameTimeSpan = document.getElementById("frameTime");
+      const dataRateSpan = document.getElementById("dataRate");
+      const systemStatusSpan = document.getElementById("systemStatus");
+      const workerStatusSpan = document.getElementById("workerStatus");
+
+      // 接收 Worker 数据
+      worker.onmessage = (e) => {
+        const data = e.data;
+        if (data.type === "sensor_data") {
+          const receiveTime = performance.now();
+          const latency = receiveTime - data.timestamp;
+
+          // 更新统计
+          dataReceiveCount++;
+          const now = Date.now();
+          if (now - lastDataTimestamp > 1000) {
+            const freq = dataReceiveCount;
+            dataRateSpan.textContent = freq;
+            dataReceiveCount = 0;
+            lastDataTimestamp = now;
+          }
+
+          workerStatusSpan.textContent = `处理中 ${latency.toFixed(1)}ms`;
+          setTimeout(() => {
+            if (workerStatusSpan) workerStatusSpan.textContent = "就绪";
+          }, 100);
+
+          // 更新点云数据 (零拷贝，直接使用 Transferable 的 ArrayBuffer)
+          if (showPoints && data.points && data.pointCount > 0) {
+            const pointsArray = new Float32Array(data.points);
+            const colorsArray = new Float32Array(data.colors);
+
+            // 更新预分配的 Buffer (增量更新)
+            const positionAttr = pointGeometry.attributes.position;
+            const colorAttr = pointGeometry.attributes.color;
+            const positionArray = positionAttr.array;
+            const colorArray = colorAttr.array;
+
+            const copyCount = Math.min(data.pointCount, MAX_POINTS);
+            for (let i = 0; i < copyCount; i++) {
+              positionArray[i * 3] = pointsArray[i * 3];
+              positionArray[i * 3 + 1] = pointsArray[i * 3 + 1];
+              positionArray[i * 3 + 2] = pointsArray[i * 3 + 2];
+              colorArray[i * 3] = colorsArray[i * 3];
+              colorArray[i * 3 + 1] = colorsArray[i * 3 + 1];
+              colorArray[i * 3 + 2] = colorsArray[i * 3 + 2];
+            }
+
+            positionAttr.needsUpdate = true;
+            colorAttr.needsUpdate = true;
+            pointGeometry.setDrawRange(0, copyCount);
+            currentPointCount = copyCount;
+            pointCountSpan.textContent = currentPointCount;
+          }
+
+          // 更新目标框 (InstancedMesh 增量更新)
+          if (showBoxes && data.boxes && data.boxes.length > 0) {
+            currentBoxList = data.boxes;
+            const boxCount = Math.min(data.boxes.length, BOX_MAX_COUNT);
+            objectCountSpan.textContent = boxCount;
+
+            for (let i = 0; i < boxCount; i++) {
+              const box = data.boxes[i];
+              // 根据类型设置颜色
+              const typeColor =
+                box.type === 0
+                  ? 0xff6633
+                  : box.type === 1
+                    ? 0x33ff66
+                    : 0x33aaff;
+              // 这里简化颜色，实际可设置每个实例不同材质参数
+              // 构建变换矩阵
+              instanceMatrix.makeTranslation(box.x, box.y + 0.8, box.z);
+              // 缩放
+              const scaleX = box.width;
+              const scaleY = box.height;
+              const scaleZ = box.length;
+              const scaleMat = new THREE.Matrix4().makeScale(
+                scaleX,
+                scaleY,
+                scaleZ,
+              );
+              const transMat = new THREE.Matrix4().makeTranslation(
+                box.x,
+                box.y + box.height / 2,
+                box.z,
+              );
+              instanceMatrix.multiplyMatrices(transMat, scaleMat);
+              instancedBoxes.setMatrixAt(i, instanceMatrix);
+            }
+
+            // 隐藏多余的实例
+            for (let i = boxCount; i < currentBoxCount; i++) {
+              instanceMatrix.makeScale(0, 0, 0);
+              instancedBoxes.setMatrixAt(i, instanceMatrix);
+            }
+
+            instancedBoxes.instanceMatrix.needsUpdate = true;
+            currentBoxCount = boxCount;
+          }
+
+          // 更新自车位置 (模拟)
+          if (data.egoPosition) {
+            egoVehicle.position.x = data.egoPosition.x;
+            egoVehicle.position.z = data.egoPosition.z;
+          }
+        }
+      };
+
+      // 控制 Worker 启动/停止
+      function setDataStream(active) {
+        dataStreamActive = active;
+        if (active) {
+          worker.postMessage({ command: "start" });
+          systemStatusSpan.textContent = "运行中";
+          systemStatusSpan.style.color = "#0f0";
+        } else {
+          worker.postMessage({ command: "stop" });
+          systemStatusSpan.textContent = "已暂停";
+          systemStatusSpan.style.color = "#ffaa44";
+        }
+      }
+
+      // UI 按钮交互
+      const toggleBtn = document.getElementById("btn-toggle-data");
+      const resetCamBtn = document.getElementById("btn-reset-camera");
+      const togglePointsBtn = document.getElementById("btn-toggle-points");
+      const toggleBoxesBtn = document.getElementById("btn-toggle-boxes");
+      const heavyBtn = document.getElementById("btn-simulate-heavy");
+
+      toggleBtn.addEventListener("click", () => {
+        dataStreamActive = !dataStreamActive;
+        setDataStream(dataStreamActive);
+        toggleBtn.textContent = dataStreamActive
+          ? "⏸️ 暂停数据流"
+          : "▶️ 启动数据流";
+      });
+
+      resetCamBtn.addEventListener("click", () => {
+        camera.position.set(8, 6, 12);
+        controls.target.set(0, 0, 0);
+        controls.update();
+      });
+
+      togglePointsBtn.addEventListener("click", () => {
+        showPoints = !showPoints;
+        pointsSystem.visible = showPoints;
+        togglePointsBtn.textContent = showPoints
+          ? "🔘 隐藏点云"
+          : "🔘 显示点云";
+      });
+
+      toggleBoxesBtn.addEventListener("click", () => {
+        showBoxes = !showBoxes;
+        instancedBoxes.visible = showBoxes;
+        toggleBoxesBtn.textContent = showBoxes
+          ? "📦 隐藏目标框"
+          : "📦 显示目标框";
+      });
+
+      heavyBtn.addEventListener("click", () => {
+        worker.postMessage({ command: "setDensity", density: 18000 });
+        heavyBtn.textContent = "⚡ 高负载模式 (点云密集)";
+        setTimeout(() => {
+          heavyBtn.textContent = "⚡ 模拟高负载";
+        }, 2000);
+      });
+
+      // ==================== 6. 动画循环与性能监控 ====================
+      let lastFrameTime = performance.now();
+      let frameCount = 0;
+
+      function animate() {
+        const now = performance.now();
+        const frameDuration = now - lastFrameTime;
+        lastFrameTime = now;
+
+        // 更新帧耗时统计 (平滑)
+        frameTimeHistory.push(frameDuration);
+        if (frameTimeHistory.length > 30) frameTimeHistory.shift();
+        const avgFrameTime =
+          frameTimeHistory.reduce((a, b) => a + b, 0) / frameTimeHistory.length;
+        frameTimeSpan.textContent = avgFrameTime.toFixed(1);
+
+        // 更新 Draw Call 统计
+        if (renderer.info && renderer.info.render) {
+          drawCallsSpan.textContent = renderer.info.render.calls;
+        }
+
+        // 更新控制环
+        controls.update();
+
+        // 渲染
+        renderer.render(scene, camera);
+        labelRenderer.render(scene, camera);
+
+        requestAnimationFrame(animate);
+        frameCount++;
+      }
+
+      // 窗口适配
+      window.addEventListener("resize", onWindowResize);
+      function onWindowResize() {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        renderer.setSize(width, height);
+        labelRenderer.setSize(width, height);
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+      }
+
+      // 启动
+      setDataStream(true);
+      animate();
+
+      console.log(
+        "辅助驾驶数据流演示已启动 | Worker + 零拷贝 + InstancedMesh + 预分配Buffer",
+      );
+    </script>
+  </body>
+</html>
